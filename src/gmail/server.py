@@ -4,6 +4,8 @@ import os
 import asyncio
 import logging
 import base64
+import re
+from html import unescape
 from email.message import EmailMessage
 from email.header import decode_header
 from base64 import urlsafe_b64decode
@@ -16,6 +18,8 @@ from mcp.server import NotificationOptions, Server
 import mcp.server.stdio
 
 
+import httplib2
+import google_auth_httplib2
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -26,6 +30,15 @@ from googleapiclient.errors import HttpError
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Network safety: without an explicit socket timeout the underlying httplib2
+# transport can block forever (stalled TLS/DNS, hung token refresh). The MCP
+# client then reports a -32001 timeout while the request is still in flight and
+# the email may silently never be sent. GMAIL_HTTP_TIMEOUT bounds each socket
+# operation; GMAIL_CALL_TIMEOUT is an outer asyncio backstop so the tool always
+# returns a clean error well before the MCP client's own timeout fires.
+GMAIL_HTTP_TIMEOUT = 30   # seconds, per socket op
+GMAIL_CALL_TIMEOUT = 45   # seconds, outer guard around a single API call
 
 EMAIL_ADMIN_PROMPTS = """You are an email administrator. 
 You can draft, edit, read, trash, open, and send emails.
@@ -145,7 +158,14 @@ class GmailService:
     def _get_service(self) -> Any:
         """Initialize Gmail API service"""
         try:
-            service = build('gmail', 'v1', credentials=self.token)
+            # Wrap the credentials in an HTTP transport with an explicit socket
+            # timeout. AuthorizedHttp also performs token refreshes over this
+            # same (timed) transport, so neither a normal request nor a refresh
+            # can hang indefinitely.
+            authed_http = google_auth_httplib2.AuthorizedHttp(
+                self.token, http=httplib2.Http(timeout=GMAIL_HTTP_TIMEOUT)
+            )
+            service = build('gmail', 'v1', http=authed_http)
             return service
         except HttpError as error:
             logger.error(f'An error occurred building Gmail service: {error}')
@@ -157,25 +177,90 @@ class GmailService:
         user_email = profile.get('emailAddress', '')
         return user_email
     
-    async def send_email(self, recipient_id: str, subject: str, message: str,) -> dict:
-        """Creates and sends an email message"""
+    async def send_draft(self, draft_id: str) -> dict:
+        """Sends an existing Gmail draft by its draft ID"""
         try:
+            send_message = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.service.users().drafts().send(userId="me", body={'id': draft_id}).execute
+                ),
+                timeout=GMAIL_CALL_TIMEOUT,
+            )
+            logger.info(f"Draft sent: {send_message['id']}")
+            return {"status": "success", "message_id": send_message["id"]}
+        except asyncio.TimeoutError:
+            logger.error(f"send_draft timed out after {GMAIL_CALL_TIMEOUT}s")
+            return {"status": "error", "error_message": f"timeout after {GMAIL_CALL_TIMEOUT}s (draft not sent)"}
+        except HttpError as error:
+            return {"status": "error", "error_message": str(error)}
+        except Exception as error:
+            logger.error(f"send_draft failed: {error}")
+            return {"status": "error", "error_message": str(error)}
+
+    @staticmethod
+    def _looks_like_html(text: str) -> bool:
+        """Heuristic: does this body look like HTML (so it should be sent as text/html)?"""
+        stripped = text.lstrip()
+        if not stripped.startswith('<'):
+            return False
+        return re.search(
+            r'(?i)<(?:html|body|div|p|table|tr|td|ul|ol|li|h[1-6]|br|span|a|strong|em|b|i)\b',
+            stripped,
+        ) is not None
+
+    @staticmethod
+    def _html_to_text(html_body: str) -> str:
+        """Best-effort plaintext rendering of an HTML body, for the multipart fallback part."""
+        text = re.sub(r'(?is)<(script|style).*?</\1>', '', html_body)
+        text = re.sub(r'(?i)<br\s*/?>', '\n', text)
+        text = re.sub(r'(?i)<li[^>]*>', '\n - ', text)
+        text = re.sub(r'(?i)</(p|div|h[1-6]|li|tr|ul|ol)>', '\n', text)
+        text = re.sub(r'<[^>]+>', '', text)
+        text = unescape(text)
+        text = re.sub(r'[ \t]+\n', '\n', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
+
+    async def send_email(self, recipient_id: str, subject: str, message: str,
+                         html: bool | None = None) -> dict:
+        """Creates and sends an email message.
+
+        Sends the body as HTML (multipart/alternative with a plaintext fallback) when
+        `html` is True, or when `html` is None and the body looks like HTML. Otherwise
+        sends as plain text. All parts are encoded as UTF-8.
+        """
+        try:
+            send_as_html = html if html is not None else self._looks_like_html(message)
+
             message_obj = EmailMessage()
-            message_obj.set_content(message)
-            
             message_obj['To'] = recipient_id
             message_obj['From'] = self.user_email
             message_obj['Subject'] = subject
 
+            if send_as_html:
+                message_obj.set_content(self._html_to_text(message), charset='utf-8')
+                message_obj.add_alternative(message, subtype='html', charset='utf-8')
+            else:
+                message_obj.set_content(message, charset='utf-8')
+
             encoded_message = base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
             create_message = {'raw': encoded_message}
-            
-            send_message = await asyncio.to_thread(
-                self.service.users().messages().send(userId="me", body=create_message).execute
+
+            send_message = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.service.users().messages().send(userId="me", body=create_message).execute
+                ),
+                timeout=GMAIL_CALL_TIMEOUT,
             )
             logger.info(f"Message sent: {send_message['id']}")
             return {"status": "success", "message_id": send_message["id"]}
+        except asyncio.TimeoutError:
+            logger.error(f"send_email timed out after {GMAIL_CALL_TIMEOUT}s")
+            return {"status": "error", "error_message": f"timeout after {GMAIL_CALL_TIMEOUT}s (email not sent)"}
         except HttpError as error:
+            return {"status": "error", "error_message": str(error)}
+        except Exception as error:
+            logger.error(f"send_email failed: {error}")
             return {"status": "error", "error_message": str(error)}
 
     async def open_email(self, email_id: str) -> str:
@@ -350,8 +435,12 @@ async def main(creds_file_path: str,
         return [
             types.Tool(
                 name="send-email",
-                description="""Sends email to recipient. 
-                Do not use if user only asked to draft email. 
+                description="""Sends email to recipient.
+                Supports both plain text and HTML bodies. Pass HTML in `message` and it
+                is sent as a formatted HTML email (with an auto-generated plaintext
+                fallback); set `html` explicitly to force the mode. UTF-8 (incl. Czech
+                diacritics) is preserved.
+                Do not use if user only asked to draft email.
                 Drafts must be approved before sending.""",
                 inputSchema={
                     "type": "object",
@@ -366,7 +455,11 @@ async def main(creds_file_path: str,
                         },
                         "message": {
                             "type": "string",
-                            "description": "Email content text",
+                            "description": "Email content. May be plain text or HTML.",
+                        },
+                        "html": {
+                            "type": "boolean",
+                            "description": "Optional. Send the body as HTML. If omitted, HTML is auto-detected from the message content.",
                         },
                     },
                     "required": ["recipient_id", "subject", "message"],
@@ -438,6 +531,20 @@ async def main(creds_file_path: str,
                     "required": ["email_id"],
                 },
             ),
+            types.Tool(
+                name="send-draft",
+                description="Sends an existing Gmail draft by its draft ID. Use this to send drafts created by other Gmail MCP tools.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "draft_id": {
+                            "type": "string",
+                            "description": "Gmail draft ID to send",
+                        },
+                    },
+                    "required": ["draft_id"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -455,16 +562,18 @@ async def main(creds_file_path: str,
             message = arguments.get("message")
             if not message:
                 raise ValueError("Missing message parameter")
-                
-            # Extract subject and message content
+            html = arguments.get("html")
+
+            # Extract subject and message content. Only treat a leading "Subject:" line
+            # as a header for plain-text bodies; HTML bodies are passed through verbatim.
             email_lines = message.split('\n')
-            if email_lines[0].startswith('Subject:'):
+            if email_lines and email_lines[0].startswith('Subject:'):
                 subject = email_lines[0][8:].strip()
                 message_content = '\n'.join(email_lines[1:]).strip()
             else:
                 message_content = message
-                
-            send_response = await gmail_service.send_email(recipient, subject, message_content)
+
+            send_response = await gmail_service.send_email(recipient, subject, message_content, html)
             
             if send_response["status"] == "success":
                 response_text = f"Email sent successfully. Message ID: {send_response['message_id']}"
@@ -502,9 +611,21 @@ async def main(creds_file_path: str,
             email_id = arguments.get("email_id")
             if not email_id:
                 raise ValueError("Missing email ID parameter")
-                
+
             msg = await gmail_service.mark_email_as_read(email_id)
             return [types.TextContent(type="text", text=str(msg))]
+        if name == "send-draft":
+            draft_id = arguments.get("draft_id")
+            if not draft_id:
+                raise ValueError("Missing draft_id parameter")
+
+            send_response = await gmail_service.send_draft(draft_id)
+
+            if send_response["status"] == "success":
+                response_text = f"Draft sent successfully. Message ID: {send_response['message_id']}"
+            else:
+                response_text = f"Failed to send draft: {send_response['error_message']}"
+            return [types.TextContent(type="text", text=response_text)]
         else:
             logger.error(f"Unknown tool: {name}")
             raise ValueError(f"Unknown tool: {name}")

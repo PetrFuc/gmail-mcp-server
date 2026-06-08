@@ -1,6 +1,7 @@
 from typing import Any
 import argparse
 import os
+import sys
 import asyncio
 import logging
 import base64
@@ -30,6 +31,51 @@ from googleapiclient.errors import HttpError
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _force_utf8_stdio() -> None:
+    """Force UTF-8 on the stdio streams the MCP transport reads/writes.
+
+    The MCP stdio transport (mcp.server.stdio.stdio_server) wraps the *text-mode*
+    ``sys.stdin`` / ``sys.stdout`` directly. On Windows those default to the ANSI
+    locale codepage (cp1250 on a Czech machine), so incoming UTF-8 JSON-RPC is
+    decoded as cp1250 and every non-ASCII char in `message` arrives as mojibake
+    (e.g. ``é`` -> ``Ă©``, ``ř`` -> ``Ĺ™``, ``°`` -> ``Â°``). The server then
+    faithfully UTF-8-encodes that mojibake, so the delivered email is corrupted.
+    Reconfiguring to UTF-8 *before* stdio_server() wraps the streams makes the
+    whole transport decode/encode as UTF-8 regardless of the OS locale.
+    """
+    for stream in (sys.stdin, sys.stdout):
+        try:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError, OSError) as exc:
+            logger.warning("Could not force UTF-8 on %s: %s", stream, exc)
+
+
+# Telltale substrings produced when UTF-8 text is decoded as cp1250 (Czech Windows
+# locale). These never occur in correct Czech text, so their presence is a reliable
+# signal that the body arrived mojibake'd over a non-UTF-8 stdio transport.
+_MOJIBAKE_MARKERS = ("Ă", "Ĺ", "Ä›", "ÄŤ", "Â°", "â€", "Ĺˇ", "Ĺľ", "Ĺ™", "ĂŻ")
+
+
+def _repair_cp1250_mojibake(text: str) -> str:
+    """Detect and reverse 'UTF-8 decoded as cp1250' mojibake.
+
+    Safety net / back-check for the stdin-encoding bug: if the body still arrives
+    corrupted (e.g. server running before the UTF-8 stdio fix took effect), recover
+    the original text by re-encoding to cp1250 and decoding as UTF-8. Bails out
+    (returns the input unchanged) if the string has no mojibake markers or cannot be
+    round-tripped — so correct text is never altered.
+    """
+    if not text or not any(m in text for m in _MOJIBAKE_MARKERS):
+        return text
+    try:
+        repaired = text.encode("cp1250").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text  # not this mojibake pattern; leave untouched
+    if repaired != text:
+        logger.warning("Repaired cp1250 mojibake in outgoing body (transport was not UTF-8).")
+    return repaired
 
 # Network safety: without an explicit socket timeout the underlying httplib2
 # transport can block forever (stalled TLS/DNS, hung token refresh). The MCP
@@ -230,6 +276,10 @@ class GmailService:
         sends as plain text. All parts are encoded as UTF-8.
         """
         try:
+            # Back-check: recover any cp1250 mojibake before building the MIME message.
+            message = _repair_cp1250_mojibake(message)
+            subject = _repair_cp1250_mojibake(subject)
+
             send_as_html = html if html is not None else self._looks_like_html(message)
 
             message_obj = EmailMessage()
@@ -357,7 +407,10 @@ class GmailService:
   
 async def main(creds_file_path: str,
                token_path: str):
-    
+
+    # Must run before stdio_server() wraps sys.stdin/stdout (fixes cp1250 mojibake).
+    _force_utf8_stdio()
+
     gmail_service = GmailService(creds_file_path, token_path)
     server = Server("gmail")
 
